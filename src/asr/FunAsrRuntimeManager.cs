@@ -225,21 +225,31 @@ namespace LiveCaptionsTranslator.asr
 
         private static string? FindPython()
         {
+            string applicationDirectory = GetApplicationDirectory();
             return FirstExistingFile(
                 Environment.GetEnvironmentVariable("FUN_ASR_PYTHON"),
-                Path.Combine(AppContext.BaseDirectory, "funasr", ".venv", "Scripts", "python.exe"),
+                Path.Combine(applicationDirectory, "funasr", ".venv", "Scripts", "python.exe"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "LiveCaptionsTranslator", "FunASR", ".venv", "Scripts", "python.exe"));
         }
 
         private static string? FindServerScript()
         {
+            string applicationDirectory = GetApplicationDirectory();
             return FirstExistingFile(
                 Environment.GetEnvironmentVariable("FUN_ASR_SERVER"),
-                Path.Combine(AppContext.BaseDirectory, "fun_asr_server.py"),
-                Path.Combine(AppContext.BaseDirectory, "funasr", "fun_asr_server.py"),
+                Path.Combine(applicationDirectory, "fun_asr_server.py"),
+                Path.Combine(applicationDirectory, "funasr", "fun_asr_server.py"),
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                     "LiveCaptionsTranslator", "FunASR", "fun_asr_server.py"));
+        }
+
+        private static string GetApplicationDirectory()
+        {
+            string? executablePath = Environment.ProcessPath;
+            return string.IsNullOrWhiteSpace(executablePath)
+                ? AppContext.BaseDirectory
+                : Path.GetDirectoryName(executablePath) ?? AppContext.BaseDirectory;
         }
 
         private static string? FindAsrModel()

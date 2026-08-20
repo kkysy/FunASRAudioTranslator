@@ -116,6 +116,18 @@ For release builds, set `FUN_ASR_REPOSITORY_URL` to the repository URL to enable
     <br>
   </div>
 
+## Before you download
+
+### Choose the correct release file
+
+| Your PC | Recommended asset | What it contains |
+|---|---|---|
+| Most Intel/AMD Windows PCs | `FunASRAudioTranslator-win-x64-withruntime.exe` | Application and .NET runtime |
+| Windows on ARM | `FunASRAudioTranslator-win-arm64-withruntime.exe` | Application and .NET runtime |
+| Either architecture, with .NET Desktop Runtime 8 already installed | The matching file **without** `-withruntime` | Smaller application-only build |
+
+`-withruntime` only removes the .NET prerequisite. It does **not** include Python, FunASR, the ASR/VAD models, or an Ollama model.
+
 ## Prerequisites
 
 <div align="center">
@@ -123,13 +135,13 @@ For release builds, set `FUN_ASR_REPOSITORY_URL` to the repository URL to enable
 | Requirement                                                                                                           | Details                                     |
 |-----------------------------------------------------------------------------------------------------------------------|---------------------------------------------|
 | <img src="https://img.shields.io/badge/Windows-11%20(22H2+)-0078D6?style=for-the-badge&logo=windows&logoColor=white"> | Required for system-audio loopback capture. |
-| <img src="https://img.shields.io/badge/.NET-8.0+-512BD4?style=for-the-badge&logo=dotnet&logoColor=white">             | Recommended. Not test in previous versions. |
+| <img src="https://img.shields.io/badge/.NET-8.0+-512BD4?style=for-the-badge&logo=dotnet&logoColor=white">             | Required only for the release files without `-withruntime`. Install the **.NET Desktop Runtime**, not the SDK. |
 
 </div>
 
 This tool requires Windows 11 22H2 or later for system-audio loopback support. It does not use Windows LiveCaptions for speech recognition.
 
-We suggest you have **.NET runtime 8.0** or higher installed. If you are not available to install one, you can download the ***with runtime*** version but its size is bigger.
+You also need a local FunASR service and a local Ollama model. They are separate, substantial downloads; the application will not download or configure either one for you. The commands below use **Python 3.10–3.12**. For CUDA, install the PyTorch build matching your GPU and driver from the [official PyTorch selector](https://pytorch.org/get-started/locally/); CPU works with `FUN_ASR_DEVICE=cpu`, but recognition will be slower.
 
 <div align="center">
   <p align="center">
@@ -139,33 +151,79 @@ We suggest you have **.NET runtime 8.0** or higher installed. If you are not ava
   </p>
 </div>
 
-## Getting Started
+## First-time setup
 
 > ⚠️ **IMPORTANT:** You must complete the following steps before running FunASR System Audio Translator for the first time.
 >
 > The application captures the Windows default output device directly; no microphone or per-application audio selection is required.
 
-### Step 1: Prepare FunASR
+### 1. Install the FunASR runtime and models
 
-Install the FunASR server separately and download the required model files from their official repositories:
+The repository provides the compatible [`fun_asr_server.py`](fun_asr_server.py). Put it and the models in a stable directory outside the application folder; the following PowerShell example uses `C:\FunASR`.
 
-- ASR model: [FunAudioLLM/Fun-ASR-Nano-2512](https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512)
-- VAD model: [funasr/fsmn-vad](https://huggingface.co/funasr/fsmn-vad)
-- FunASR project and server documentation: [modelscope/FunASR](https://github.com/modelscope/FunASR)
+```powershell
+$root = 'C:\FunASR'
+$python = "$root\.venv\Scripts\python.exe"
+New-Item -ItemType Directory -Force -Path "$root\models" | Out-Null
+py -3.12 -m venv "$root\.venv"
+& $python -m pip install --upgrade pip
 
-The model files are intentionally excluded from this repository. Keep them outside the Git working tree, or add any local model directory to `.gitignore`.
+# CPU-only example. For CUDA, use the command from pytorch.org instead.
+& $python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+& $python -m pip install funasr==1.3.9 huggingface_hub
+Invoke-WebRequest https://raw.githubusercontent.com/kkysy/FunASRAudioTranslator/main/fun_asr_server.py -OutFile "$root\fun_asr_server.py"
 
-If you want the application to start a local FunASR service automatically, make the server script and models available and set:
+& $python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='FunAudioLLM/Fun-ASR-Nano-2512', local_dir=r'C:\FunASR\models\Fun-ASR-Nano-2512')"
+& $python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='funasr/fsmn-vad', local_dir=r'C:\FunASR\models\fsmn-vad')"
+```
 
-- `FUN_ASR_PYTHON`: Python executable
-- `FUN_ASR_SERVER`: `fun_asr_server.py`
-- `FUN_ASR_MODEL`: complete `Fun-ASR-Nano-2512` model directory
-- `FUN_ASR_VAD_MODEL`: FSMN-VAD model directory
-- `FUN_ASR_DEVICE`: `cuda:0` or `cpu`
+The complete ASR directory must contain `model.pt` (it is over 1 GB). The service and models are intentionally separate from the application release. If you already run another service, it must provide `GET /health` and accept the app's `multipart/form-data` `POST /inference`, returning JSON with a `text` field.
 
-### Step 2: Configure the application
+### 2. Let the application start FunASR automatically
 
-Start the application, open Settings, verify the FunASR server address, choose Japanese or English as the source language, choose a target language, and configure the local Ollama service. The default FunASR address is `http://127.0.0.1:8177`.
+Set these **user** environment variables once, then close and reopen the application. The default device is `cuda:0`; use `cpu` if you installed CPU PyTorch or do not have a supported CUDA GPU.
+
+```powershell
+setx FUN_ASR_PYTHON "C:\FunASR\.venv\Scripts\python.exe"
+setx FUN_ASR_SERVER "C:\FunASR\fun_asr_server.py"
+setx FUN_ASR_MODEL "C:\FunASR\models\Fun-ASR-Nano-2512"
+setx FUN_ASR_VAD_MODEL "C:\FunASR\models\fsmn-vad"
+setx FUN_ASR_DEVICE "cpu"
+```
+
+At startup the app checks `http://127.0.0.1:8177/health`; if it is not available, it launches the configured script. An app-owned service stops when the app exits normally. To diagnose the service independently, run this command in a new PowerShell window and wait for `listening on`:
+
+```powershell
+& 'C:\FunASR\.venv\Scripts\python.exe' 'C:\FunASR\fun_asr_server.py' --host 127.0.0.1 --port 8177 --model 'C:\FunASR\models\Fun-ASR-Nano-2512' --vad-model 'C:\FunASR\models\fsmn-vad' --device cpu --hub hf --disable-update
+```
+
+Then verify it from another window:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8177/health
+```
+
+### 3. Install and configure Ollama
+
+Install Ollama using its [official Windows installer](https://ollama.com/download/windows). It normally runs in the background and exposes `http://localhost:11434`. Download a local instruction model that fits your hardware, then note its exact name:
+
+```powershell
+ollama pull <model-name>
+ollama ls
+```
+
+In the application **Settings**, set the Ollama URL (normally `http://localhost:11434`) and enter that exact installed model name. A model name is deliberately not prefilled, so translation will fail until this is done.
+
+### 4. Configure and run the application
+
+Start the downloaded EXE, open **Settings**, and:
+
+1. Confirm the FunASR address is `http://127.0.0.1:8177`, or enter your existing compatible server address and click **Reconnect FunASR**.
+2. Select Japanese or English as the recognition language.
+3. Select the target language and complete the Ollama settings above.
+4. Play audio through the current Windows **default output** device. There is no microphone or per-application capture setting.
+
+`FUN_ASR_REPOSITORY_URL` is optional and only enables in-app update checks; it is not required to caption or translate.
 
 <div align="center">
   <img src="images/settings.png" alt="FunASR and Ollama settings" width="90%" />

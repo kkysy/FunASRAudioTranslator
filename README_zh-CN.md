@@ -116,6 +116,16 @@
     <br>
   </div>
 
+## 下载前先选对文件
+
+| 你的电脑 | 建议下载 | 包含内容 |
+|---|---|---|
+| 大多数 Intel/AMD Windows 电脑 | `FunASRAudioTranslator-win-x64-withruntime.exe` | 程序与 .NET 运行时 |
+| Windows on ARM | `FunASRAudioTranslator-win-arm64-withruntime.exe` | 程序与 .NET 运行时 |
+| 已安装 .NET Desktop Runtime 8 的对应架构电脑 | 不带 `-withruntime` 的同架构文件 | 较小的纯程序版本 |
+
+`-withruntime` 只免除了 .NET 前置要求，**不**包含 Python、FunASR、ASR/VAD 模型或 Ollama 模型。
+
 ## 系统要求
 
 <div align="center">
@@ -123,13 +133,13 @@
 | 要求                                                                                                                    | 详情          |
 |-----------------------------------------------------------------------------------------------------------------------|-------------|
 | <img src="https://img.shields.io/badge/Windows-11%20(22H2+)-0078D6?style=for-the-badge&logo=windows&logoColor=white"> | 系统音频回环采集所需版本 |
-| <img src="https://img.shields.io/badge/.NET-8.0+-512BD4?style=for-the-badge&logo=dotnet&logoColor=white">             | 推荐。未在之前版本测试 |
+| <img src="https://img.shields.io/badge/.NET-8.0+-512BD4?style=for-the-badge&logo=dotnet&logoColor=white">             | 仅不带 `-withruntime` 的版本需要；请安装 **.NET Desktop Runtime**，不是 SDK。 |
 
 </div>
 
 本工具需要 Windows 11 22H2 或更高版本以支持系统音频回环采集，但不再使用 Windows 实时字幕进行语音识别。
 
-我们建议您安装 **.NET运行时8.0** 或更高版本。如果您无法安装，可以下载 ***with runtime*** 版本，但其文件较大。
+还需要单独准备本地 FunASR 服务和本地 Ollama 模型；程序不会替你下载或配置它们。下面命令使用 **Python 3.10–3.12**。使用 CUDA 时，请从 [PyTorch 官方安装页](https://pytorch.org/get-started/locally/) 按显卡和驱动选择对应命令；没有可用 CUDA 时，设为 `FUN_ASR_DEVICE=cpu`，但识别会更慢。
 
 <div align="center">
   <p align="center">
@@ -139,33 +149,79 @@
   </p>
 </div>
 
-## 入门指南
+## 首次配置
 
 > ⚠️ **重要:** 首次运行 FunASR System Audio Translator 前，您必须完成以下步骤。
 >
 > 程序直接采集 Windows 默认输出设备的系统音频，不需要麦克风，也不能选择单独的应用程序音频。
 
-### 步骤1: 准备 FunASR
+### 1. 安装 FunASR 运行环境与模型
 
-单独安装 FunASR 服务，并从官方仓库下载所需模型：
+仓库提供与本程序兼容的 [`fun_asr_server.py`](fun_asr_server.py)。请将脚本和模型放在程序目录之外的稳定位置；以下 PowerShell 示例使用 `C:\FunASR`。
 
-- ASR 模型：[FunAudioLLM/Fun-ASR-Nano-2512](https://huggingface.co/FunAudioLLM/Fun-ASR-Nano-2512)
-- VAD 模型：[funasr/fsmn-vad](https://huggingface.co/funasr/fsmn-vad)
-- FunASR 项目与服务端说明：[modelscope/FunASR](https://github.com/modelscope/FunASR)
+```powershell
+$root = 'C:\FunASR'
+$python = "$root\.venv\Scripts\python.exe"
+New-Item -ItemType Directory -Force -Path "$root\models" | Out-Null
+py -3.12 -m venv "$root\.venv"
+& $python -m pip install --upgrade pip
 
-模型文件会被明确排除在本仓库之外。请将模型放在 Git 工作区外，或将本地模型目录加入 `.gitignore`。
+# CPU 示例。使用 CUDA 时，请改用 pytorch.org 为你的显卡生成的命令。
+& $python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+& $python -m pip install funasr==1.3.9 huggingface_hub
+Invoke-WebRequest https://raw.githubusercontent.com/kkysy/FunASRAudioTranslator/main/fun_asr_server.py -OutFile "$root\fun_asr_server.py"
 
-如果希望程序自动启动本地 FunASR 服务，请准备好服务端脚本和模型，并设置以下环境变量：
+& $python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='FunAudioLLM/Fun-ASR-Nano-2512', local_dir=r'C:\FunASR\models\Fun-ASR-Nano-2512')"
+& $python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='funasr/fsmn-vad', local_dir=r'C:\FunASR\models\fsmn-vad')"
+```
 
-- `FUN_ASR_PYTHON`: Python 可执行文件
-- `FUN_ASR_SERVER`: `fun_asr_server.py`
-- `FUN_ASR_MODEL`: 完整 `Fun-ASR-Nano-2512` 模型目录
-- `FUN_ASR_VAD_MODEL`: FSMN-VAD 模型目录
-- `FUN_ASR_DEVICE`: `cuda:0` 或 `cpu`
+完整 ASR 目录必须含有 `model.pt`（超过 1 GB）。服务和模型会与程序 Release 分开提供。如果你已有其他服务，它必须提供 `GET /health`，接受本程序的 `multipart/form-data` `POST /inference`，并返回包含 `text` 字段的 JSON。
 
-### 步骤2: 配置程序
+### 2. 让程序自动启动 FunASR
 
-启动程序，打开设置页，确认 FunASR 服务地址，选择日语或英语作为源语言，选择目标语言，并配置本地 Ollama 服务。默认 FunASR 服务地址为 `http://127.0.0.1:8177`。
+下面环境变量只需设置一次；然后关闭并重新打开程序。默认设备是 `cuda:0`；如果安装的是 CPU 版 PyTorch，或没有可用 CUDA，请使用 `cpu`。
+
+```powershell
+setx FUN_ASR_PYTHON "C:\FunASR\.venv\Scripts\python.exe"
+setx FUN_ASR_SERVER "C:\FunASR\fun_asr_server.py"
+setx FUN_ASR_MODEL "C:\FunASR\models\Fun-ASR-Nano-2512"
+setx FUN_ASR_VAD_MODEL "C:\FunASR\models\fsmn-vad"
+setx FUN_ASR_DEVICE "cpu"
+```
+
+程序启动时会检查 `http://127.0.0.1:8177/health`；服务不在时便按上述配置启动脚本。由程序启动的服务会在程序正常退出时停止。需要独立排查时，可在新的 PowerShell 窗口运行以下命令，等待出现 `listening on`：
+
+```powershell
+& 'C:\FunASR\.venv\Scripts\python.exe' 'C:\FunASR\fun_asr_server.py' --host 127.0.0.1 --port 8177 --model 'C:\FunASR\models\Fun-ASR-Nano-2512' --vad-model 'C:\FunASR\models\fsmn-vad' --device cpu --hub hf --disable-update
+```
+
+再在另一个窗口验证：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8177/health
+```
+
+### 3. 安装并配置 Ollama
+
+从 [Ollama Windows 官方安装器](https://ollama.com/download/windows) 安装。它通常会在后台运行，并在 `http://localhost:11434` 提供服务。下载一个适合自己硬件的本地指令模型，并记下完整模型名：
+
+```powershell
+ollama pull <模型名>
+ollama ls
+```
+
+在程序 **设置** 中填写 Ollama URL（通常为 `http://localhost:11434`）和该模型的完整名称。程序故意没有预填模型名；未填写前翻译会失败。
+
+### 4. 配置并运行程序
+
+启动下载的 EXE，打开 **设置** 后：
+
+1. 确认 FunASR 地址为 `http://127.0.0.1:8177`；如使用已有服务，填写地址并点击 **Reconnect FunASR**。
+2. 选择日语或英语识别语言。
+3. 选择目标语言，并完成上述 Ollama 配置。
+4. 通过当前 Windows **默认输出设备** 播放音频。程序不提供麦克风或单独应用采集。
+
+`FUN_ASR_REPOSITORY_URL` 仅用于启用应用内更新检查，字幕和翻译不需要设置它。
 
 <div align="center">
   <img src="images/settings.png" alt="FunASR 与 Ollama 设置" width="90%" />
