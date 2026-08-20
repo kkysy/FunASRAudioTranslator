@@ -1,0 +1,435 @@
+﻿using System.Diagnostics;
+using System.Collections.Concurrent;
+using System.IO;
+using System.Text;
+
+using LiveCaptionsTranslator.apis;
+using LiveCaptionsTranslator.asr;
+using LiveCaptionsTranslator.models;
+using LiveCaptionsTranslator.utils;
+
+namespace LiveCaptionsTranslator
+{
+    public static class Translator
+    {
+        private static Caption? caption = null;
+        private static Setting? setting = null;
+        private static FunAsrCaptionSource? captionSource = null;
+        private static readonly FunAsrRuntimeManager runtimeManager = new();
+        private static string captionSourceStatus = "Starting...";
+
+        private static readonly ConcurrentQueue<string> pendingTextQueue = new();
+        private static readonly TranslationTaskQueue translationTaskQueue = new();
+        private static readonly TaskCompletionSource translationApiReady = new(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public static Caption? Caption => caption;
+        public static Setting? Setting => setting;
+        public static string CaptionSourceStatus => captionSourceStatus;
+
+        public static bool LogOnlyFlag { get; set; } = false;
+        public static bool FirstUseFlag { get; set; } = false;
+
+        public static event Action? TranslationLogged;
+        public static event Action<string>? CaptionSourceStatusChanged;
+
+        static Translator()
+        {
+            if (!models.Setting.IsConfigExist())
+                FirstUseFlag = true;
+
+            caption = Caption.GetInstance();
+            setting = Setting.Load();
+            runtimeManager.StatusChanged += UpdateCaptionSourceStatus;
+        }
+
+        public static void StartCaptionSource()
+        {
+            _ = StartCaptionSourceAsync();
+        }
+
+        public static void StartTranslationApiWarmup()
+        {
+            _ = WarmUpTranslationApiAsync();
+        }
+
+        private static async Task WarmUpTranslationApiAsync()
+        {
+            try
+            {
+                await TranslateAPI.WarmUpOllamaAsync();
+            }
+            finally
+            {
+                // A failed warm-up must not permanently disable translation.  The regular
+                // request path will still surface its existing error message.
+                translationApiReady.TrySetResult();
+            }
+        }
+
+        private static async Task StartCaptionSourceAsync()
+        {
+            if (captionSource != null)
+                return;
+
+            bool ready = await runtimeManager.EnsureStartedAsync(Setting.FunAsrServerUrl);
+            if (!ready)
+                return;
+
+            captionSource = new FunAsrCaptionSource(
+                Setting.FunAsrServerUrl,
+                NormalizeSourceLanguage(Setting.SourceLanguage));
+            captionSource.StatusChanged += UpdateCaptionSourceStatus;
+            captionSource.Start();
+            await captionSource.ProbeAsync();
+        }
+
+        public static async Task RestartCaptionSourceAsync()
+        {
+            if (captionSource != null)
+            {
+                captionSource.StatusChanged -= UpdateCaptionSourceStatus;
+                captionSource.Dispose();
+                captionSource = null;
+            }
+
+            runtimeManager.StopOwnedProcess();
+            await StartCaptionSourceAsync();
+        }
+
+        public static void ChangeSourceLanguage(string language)
+        {
+            string normalized = NormalizeSourceLanguage(language);
+            Setting.SourceLanguage = normalized;
+            captionSource?.ChangeLanguage(normalized);
+
+            while (pendingTextQueue.TryDequeue(out _))
+            {
+            }
+
+            if (Caption != null)
+            {
+                Caption.OriginalCaption = string.Empty;
+                Caption.DisplayOriginalCaption = string.Empty;
+                Caption.OverlayOriginalCaption = " ";
+            }
+            ClearContexts();
+        }
+
+        public static void StopCaptionSource()
+        {
+            if (captionSource != null)
+                captionSource.StatusChanged -= UpdateCaptionSourceStatus;
+            captionSource?.Dispose();
+            captionSource = null;
+            runtimeManager.Dispose();
+        }
+
+        private static void UpdateCaptionSourceStatus(string value)
+        {
+            captionSourceStatus = value;
+            CaptionSourceStatusChanged?.Invoke(value);
+        }
+
+        private static string NormalizeSourceLanguage(string? language)
+        {
+            return string.Equals(language, "en", StringComparison.OrdinalIgnoreCase) ? "en" : "ja";
+        }
+
+        public static void SyncLoop()
+        {
+            int idleCount = 0;
+            int syncCount = 0;
+
+            while (true)
+            {
+                string fullText = captionSource?.CurrentSnapshot ?? string.Empty;
+                if (string.IsNullOrEmpty(fullText))
+                {
+                    Thread.Sleep(50);
+                    continue;
+                }
+
+                // Preprocess
+                fullText = RegexPatterns.Acronym().Replace(fullText, "$1$2");
+                fullText = RegexPatterns.AcronymWithWords().Replace(fullText, "$1 $2");
+                fullText = RegexPatterns.PunctuationSpace().Replace(fullText, "$1 ");
+                fullText = RegexPatterns.CJPunctuationSpace().Replace(fullText, "$1");
+                // Replace redundant newlines within ASR output with sentence punctuation.
+                fullText = TextUtil.ReplaceNewlines(fullText, TextUtil.MEDIUM_THRESHOLD);
+
+                // Prevent adding the last sentence from previous running to log cards
+                // before the first sentence is completed.
+                if (fullText.IndexOfAny(TextUtil.PUNC_EOS) == -1 && Caption.Contexts.Count > 0)
+                    ClearContexts();
+
+                // Get the last sentence.
+                int lastEOSIndex;
+                if (Array.IndexOf(TextUtil.PUNC_EOS, fullText[^1]) != -1)
+                    lastEOSIndex = fullText[0..^1].LastIndexOfAny(TextUtil.PUNC_EOS);
+                else
+                    lastEOSIndex = fullText.LastIndexOfAny(TextUtil.PUNC_EOS);
+                string latestCaption = fullText.Substring(lastEOSIndex + 1);
+                if (string.IsNullOrWhiteSpace(latestCaption))
+                {
+                    Thread.Sleep(25);
+                    continue;
+                }
+
+                // If the last sentence is too short, extend it by adding the previous sentence.
+                // The ASR stabilizer may commit multiple characters including EOS at once.
+                if (lastEOSIndex > 0 && Encoding.UTF8.GetByteCount(latestCaption) < TextUtil.SHORT_THRESHOLD)
+                {
+                    lastEOSIndex = fullText[0..lastEOSIndex].LastIndexOfAny(TextUtil.PUNC_EOS);
+                    latestCaption = fullText.Substring(lastEOSIndex + 1);
+                }
+
+                // `OverlayOriginalCaption`: The sentence to be displayed on Overlay Window.
+                Caption.OverlayOriginalCaption = latestCaption;
+                for (int historyCount = Math.Min(Setting.DisplaySentences, Caption.Contexts.Count);
+                     historyCount > 0 && lastEOSIndex > 0;
+                     historyCount--)
+                {
+                    lastEOSIndex = fullText[0..lastEOSIndex].LastIndexOfAny(TextUtil.PUNC_EOS);
+                    Caption.OverlayOriginalCaption = fullText.Substring(lastEOSIndex + 1);
+                }
+
+                // `DisplayOriginalCaption`: The sentence to be displayed on Main Window.
+                if (string.CompareOrdinal(Caption.DisplayOriginalCaption, latestCaption) != 0)
+                {
+                    Caption.DisplayOriginalCaption = latestCaption;
+                    // If the last sentence is too long, truncate it when displayed.
+                    Caption.DisplayOriginalCaption =
+                        TextUtil.ShortenDisplaySentence(Caption.DisplayOriginalCaption, TextUtil.VERYLONG_THRESHOLD);
+                }
+
+                // Prepare for `OriginalCaption`. If Expanded, only retain the complete sentence.
+                int lastEOS = latestCaption.LastIndexOfAny(TextUtil.PUNC_EOS);
+                if (lastEOS != -1)
+                    latestCaption = latestCaption.Substring(0, lastEOS + 1);
+                // `OriginalCaption`: The sentence to be really translated.
+                if (string.CompareOrdinal(Caption.OriginalCaption, latestCaption) != 0)
+                {
+                    Caption.OriginalCaption = latestCaption;
+
+                    idleCount = 0;
+                    if (Array.IndexOf(TextUtil.PUNC_EOS, Caption.OriginalCaption[^1]) != -1)
+                    {
+                        syncCount = 0;
+                        pendingTextQueue.Enqueue(Caption.OriginalCaption);
+                    }
+                    else if (Encoding.UTF8.GetByteCount(Caption.OriginalCaption) >= TextUtil.SHORT_THRESHOLD)
+                        syncCount++;
+                }
+                else
+                    idleCount++;
+
+                // `TranslateFlag` determines whether this sentence should be translated.
+                // When `OriginalCaption` remains unchanged, `idleCount` +1; when `OriginalCaption` changes, `MaxSyncInterval` +1.
+                if (syncCount > Setting.MaxSyncInterval ||
+                    idleCount == Setting.MaxIdleInterval)
+                {
+                    syncCount = 0;
+                    pendingTextQueue.Enqueue(Caption.OriginalCaption);
+                }
+
+                Thread.Sleep(25);
+            }
+        }
+
+        public static async Task TranslateLoop()
+        {
+            await translationApiReady.Task;
+            while (true)
+            {
+                // Translate only the newest snapshot.  Old partial captions cannot be useful
+                // once a more complete transcript is available.
+                string? originalSnapshot = null;
+                while (pendingTextQueue.TryDequeue(out var pendingSnapshot))
+                    originalSnapshot = pendingSnapshot;
+
+                if (originalSnapshot != null)
+                {
+                    if (LogOnlyFlag)
+                    {
+                        bool isOverwrite = await IsOverwrite(originalSnapshot);
+                        await LogOnly(originalSnapshot, isOverwrite);
+                    }
+                    else
+                    {
+                        translationTaskQueue.Enqueue(token => Translate(originalSnapshot, token), originalSnapshot);
+                    }
+                }
+
+                Thread.Sleep(40);
+            }
+        }
+
+        public static async Task DisplayLoop()
+        {
+            while (true)
+            {
+                var (translatedText, isChoke) = translationTaskQueue.Output;
+
+                if (LogOnlyFlag)
+                {
+                    Caption.TranslatedCaption = string.Empty;
+                    Caption.DisplayTranslatedCaption = "[Paused]";
+                    Caption.OverlayNoticePrefix = "[Paused]";
+                    Caption.OverlayCurrentTranslation = string.Empty;
+                }
+                else if (!string.IsNullOrEmpty(RegexPatterns.NoticePrefix().Replace(
+                             translatedText, string.Empty).Trim()) &&
+                         string.CompareOrdinal(Caption.TranslatedCaption, translatedText) != 0)
+                {
+                    // Main page
+                    Caption.TranslatedCaption = translatedText;
+                    Caption.DisplayTranslatedCaption =
+                        TextUtil.ShortenDisplaySentence(Caption.TranslatedCaption, TextUtil.VERYLONG_THRESHOLD);
+
+                    // Overlay window
+                    if (Caption.TranslatedCaption.Contains("[ERROR]") || Caption.TranslatedCaption.Contains("[WARNING]"))
+                        Caption.OverlayCurrentTranslation = Caption.TranslatedCaption;
+                    else
+                    {
+                        var match = RegexPatterns.NoticePrefixAndTranslation().Match(Caption.TranslatedCaption);
+                        Caption.OverlayNoticePrefix = match.Groups[1].Value.Trim();
+                        Caption.OverlayCurrentTranslation = match.Groups[2].Value.Trim();
+                    }
+                }
+
+                // If the original sentence is a complete sentence, choke for better visual experience.
+                if (isChoke)
+                    Thread.Sleep(720);
+                Thread.Sleep(40);
+            }
+        }
+
+        public static async Task<(string, bool)> Translate(string text, CancellationToken token = default)
+        {
+            string translatedText;
+            bool isChoke = Array.IndexOf(TextUtil.PUNC_EOS, text[^1]) != -1;
+
+            try
+            {
+                var sw = Setting.MainWindow.LatencyShow ? Stopwatch.StartNew() : null;
+
+                if (Setting.ContextAware && !TranslateAPI.IsLLMBased)
+                {
+                    translatedText = await TranslateAPI.TranslateFunction($"{Caption.AwareContextsCaption} 🔤 {text} 🔤", token);
+                    translatedText = RegexPatterns.TargetSentence().Match(translatedText).Groups[1].Value;
+                }
+                else
+                {
+                    translatedText = await TranslateAPI.TranslateFunction(text, token);
+                    translatedText = translatedText.Replace("🔤", "");
+                }
+
+                if (sw != null)
+                {
+                    sw.Stop();
+                    translatedText = $"[{sw.ElapsedMilliseconds,4} ms] " + translatedText;
+                }
+            }
+            catch (OperationCanceledException ex)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                return ($"[ERROR] Translation Failed: {ex.Message}", isChoke);
+            }
+
+            return (translatedText, isChoke);
+        }
+
+        public static async Task Log(string originalText, string translatedText,
+            bool isOverwrite = false, CancellationToken token = default)
+        {
+            string targetLanguage, apiName;
+            if (Setting != null)
+            {
+                targetLanguage = Setting.TargetLanguage;
+                apiName = Setting.ApiName;
+            }
+            else
+            {
+                targetLanguage = "N/A";
+                apiName = "N/A";
+            }
+
+            try
+            {
+                if (isOverwrite)
+                    await SQLiteHistoryLogger.DeleteLastTranslation(token);
+                await SQLiteHistoryLogger.LogTranslation(originalText, translatedText, targetLanguage, apiName);
+                TranslationLogged?.Invoke();
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                SnackbarHost.Show("[ERROR] Logging history failed.", ex.Message, SnackbarType.Error,
+                    timeout: 2, closeButton: true);
+            }
+        }
+
+        public static async Task LogOnly(string originalText,
+            bool isOverwrite = false, CancellationToken token = default)
+        {
+            try
+            {
+                if (isOverwrite)
+                    await SQLiteHistoryLogger.DeleteLastTranslation(token);
+                await SQLiteHistoryLogger.LogTranslation(originalText, "N/A", "N/A", "LogOnly");
+                TranslationLogged?.Invoke();
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                SnackbarHost.Show("[ERROR] Logging history failed.", ex.Message, SnackbarType.Error,
+                    timeout: 2, closeButton: true);
+            }
+        }
+
+        public static async Task AddContexts(CancellationToken token = default)
+        {
+            var lastLog = await SQLiteHistoryLogger.LoadLastTranslation(token);
+            if (lastLog == null)
+                return;
+
+            if (Caption?.Contexts.Count >= Caption.MAX_CONTEXTS)
+                Caption.Contexts.Dequeue();
+            Caption?.Contexts.Enqueue(lastLog);
+
+            Caption?.OnPropertyChanged("DisplayLogCards");
+            Caption?.OnPropertyChanged("OverlayPreviousTranslation");
+        }
+
+        public static void ClearContexts()
+        {
+            Caption?.Contexts.Clear();
+
+            Caption?.OnPropertyChanged("DisplayLogCards");
+            Caption?.OnPropertyChanged("OverlayPreviousTranslation");
+        }
+
+        // If this text is too similar to the last one, overwrite it when logging.
+        public static async Task<bool> IsOverwrite(string originalText, CancellationToken token = default)
+        {
+            string lastOriginalText = await SQLiteHistoryLogger.LoadLastSourceText(token);
+            if (lastOriginalText == null)
+                return false;
+
+            int minLen = Math.Min(originalText.Length, lastOriginalText.Length);
+            originalText = originalText.Substring(0, minLen);
+            lastOriginalText = lastOriginalText.Substring(0, minLen);
+
+            double similarity = TextUtil.Similarity(originalText, lastOriginalText);
+            return similarity > TextUtil.SIM_THRESHOLD;
+        }
+    }
+}
